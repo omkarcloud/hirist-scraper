@@ -1,0 +1,10 @@
+services:
+  hirist-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — Hirist does not rate-limit, so leave this unset.
+      # - HIRIST_PROXY=http://user:pass@host:port
