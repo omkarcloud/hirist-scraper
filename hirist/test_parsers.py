@@ -351,6 +351,7 @@ def test_jobs_details_batch_similar(offline):
 def test_companies(offline):
     out = companies.search(query="nagarro")
     assert out["companies"][0]["slug"] == "nagarro-software" and out["pagination"]["total_count"] == 1
+    assert out["companies"][0]["name"] == "Nagarro Software"   # the index's lower-cased name, restored
     out = companies.search(location=[3], category=[14], page=2)
     assert out["pagination"]["page"] == 2 and out["filters"]["categories"][0]["name"] == "AI/ML"
     out = companies.details({"slug": "nagarro-software", "name": None})

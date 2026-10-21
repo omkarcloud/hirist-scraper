@@ -30,6 +30,12 @@ def search(query=None, location=None, category=None, page=1):
     params = _list_params(location, category)
     if query:
         raw = fetch.company_search(query, page - 1, params)
+        # the search index lower-cases names: restore each page's own name
+        try:
+            raw = {**raw, "docs": [_with_proper_name(d, S.text(d.get("slug"))) if isinstance(d, dict) else d
+                                   for d in raw.get("docs") or []]}
+        except fetch.HiristUpstreamError as e:
+            print(f"hirist: proper company names skipped: {e}")
     else:
         raw = fetch.company_list(page - 1, params)
     result = P.company_list_result(raw, page, refdata.COMPANY_LIST_PAGE_SIZE)
