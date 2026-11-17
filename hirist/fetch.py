@@ -45,10 +45,14 @@ Logged out, /detail masks applyCount / hits / recruiterName as '*****'
 (the feeds still carry the counts). /jobfeed and /insights need a login and
 are not used.
 
-Egress: config.hirist_proxy() — in the hosted service every call rides a
-sticky residential exit (hirist never sees the server's own IP), one exit
-per thread reused until a call fails; a 429 / 403 / 5xx retries on a fresh
-exit. No rate limit or challenge was seen (the Apify actors on the same
+Egress: config.hirist_proxy() — in the hosted service every call rides the
+Mumbai gateway exit (knob HIRIST_PROXY_COUNTRY = "gateway:in", 2026-11-11; a
+fresh gateway address per request, hirist never sees the server's own IP), one
+session per thread; a 429 / 403 / 5xx retries on a fresh session and a
+call's last retry rides a sticky Indian residential exit
+(HIRIST_FALLBACK_PROXY_COUNTRY). A residential country in the knob gives
+the older shape: one sticky exit per thread reused until a call fails.
+No rate limit or challenge was seen (the Apify actors on the same
 backend report the same). The standalone package's config returns its
 HIRIST_PROXY env var or None (direct, your own IP). The patchright click-through
 (indeed/fetch.py _browser_page) is the escalation if a challenge ever
@@ -61,6 +65,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   HiristNotFound       no such job / company / recruiter         — never retried
 """
 import json
+import fastjson
 import os
 import sys
 import threading
@@ -72,13 +77,16 @@ from urllib.parse import urlencode
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from hirist import refdata
+from scraper_utils import debug, fanout, memo, sessions
+from scraper_utils.pages import is_challenged
 
 IMPERSONATE = "chrome"
 TIMEOUT = (10, 60)            # (connect, read) — /tags and /companies/slugs are big
 
-JSON_HEADERS = {"accept": "application/json, text/plain, */*", "accept-language": "en-US,en;q=0.9",
+JSON_HEADERS = {"accept": "application/json, text/plain, */*",
                 "origin": refdata.BASE_URL, "referer": refdata.BASE_URL + "/", "version": "2"}
 CF_MARKERS = ("just a moment", "challenge-error-text", "cf-chl", "challenge-platform", "attention required")
 
@@ -117,14 +125,7 @@ class HiristNotFound(NotFound):
 
 def dump_debug(name, text):
     """Write a raw response to $HIRIST_DEBUG_DIR/<name>.txt for post-mortems."""
-    dbg = os.environ.get("HIRIST_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("HIRIST_DEBUG_DIR", name, text)
 
 
 # ---- curl sessions (per thread, keyed by exit) ---------------------------------------------------
@@ -133,49 +134,28 @@ _local = threading.local()
 
 
 def _sessions():
-    store = getattr(_local, "sessions", None)
-    if store is None:
-        store = _local.sessions = OrderedDict()
-    return store
+    return sessions.thread_store(_local)
 
 
 def _session(key, proxy):
-    from curl_cffi import requests as curl_requests
-    store = _sessions()
-    sess = store.get(key)
-    if sess is None:
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        store[key] = sess
-        while len(store) > 4:
-            _, old = store.popitem(last=False)
-            try:
-                old.close()
-            except Exception:
-                pass
-    else:
-        store.move_to_end(key)
-    return sess
+    return sessions.keyed(_sessions(), key, lambda: sessions.speaking(
+        egress.new_session(proxy, impersonate=IMPERSONATE), egress.accept_language(proxy)), 4)
 
 
 def _drop_session(key):
-    sess = _sessions().pop(key, None)
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop_keyed(_sessions(), key)
 
 
-def _exit(fresh=False):
-    """(session key, proxy) for this thread: one sticky exit reused call
-    after call (its curl session keeps the connection warm), a fresh one
-    after a failure. config.hirist_proxy() None = direct (the standalone
-    package run on your own machine)."""
+def _exit(fresh=False, fallback=False):
+    """(session key, proxy) for this thread: one exit reused call after call
+    (its curl session keeps the connection warm), a fresh one after a
+    failure, the fallback exit (config.HIRIST_FALLBACK_PROXY_COUNTRY) on a
+    call's last retry. config.hirist_proxy() is the gateway exit ("gateway:in",
+    a fresh gateway address per request on one session), a sticky proxy exit, or
+    None = direct (the standalone package run on your own machine)."""
     held = getattr(_local, "exit", None)
     if held is None or fresh:
-        proxy = config.hirist_proxy(fallback=fresh)
+        proxy = config.hirist_proxy(fallback=fallback)
         held = (f"{proxy or 'direct'}", proxy)
         _local.exit = held
     return held
@@ -184,14 +164,23 @@ def _exit(fresh=False):
 def _attempts(label, send):
     """Run send(session) under the retry policy: HiristUpstreamError (incl.
     Blocked) retries on a fresh exit up to config.HIRIST_MAX_ATTEMPTS
-    times; BadRequest / NotFound surface at once."""
+    times; BadRequest / NotFound surface at once. A call's LAST retry rides
+    the fallback exit (an Indian residential one), so a call the gateway
+    keeps failing still gets one try the old way; the thread does not keep
+    that exit, its next call starts on the configured one again."""
     attempts = max(1, int(config.HIRIST_MAX_ATTEMPTS))
     last = None
     for attempt in range(1, attempts + 1):
-        key, proxy = _exit(fresh=attempt > 1)
+        fallback = 1 < attempt == attempts
+        key, proxy = _exit(fresh=attempt > 1, fallback=fallback)
         sess = _session(key, proxy)
         try:
-            return send(sess)
+            try:
+                return send(sess)
+            finally:
+                if fallback:
+                    _drop_session(key)
+                    _local.exit = None
         except (HiristBadRequest, HiristNotFound):
             raise
         except HiristUpstreamError as e:
@@ -204,13 +193,6 @@ def _attempts(label, send):
         if attempt < attempts:
             time.sleep(1.0 * attempt)
     raise last
-
-
-def is_challenged(status, headers, text):
-    if (headers or {}).get("cf-mitigated") == "challenge":
-        return True
-    head = (text or "")[:4000].lower()
-    return status in (403, 429, 503) and any(m in head for m in CF_MARKERS)
 
 
 def _error_message(body, text):
@@ -233,7 +215,7 @@ def _classify(resp, label, missing_on_500=False):
     if status in (403, 429):
         raise HiristBlocked(f"HTTP {status} on {label}")
     try:
-        body = json.loads(text) if text else None
+        body = fastjson.loads(text) if text else None
     except ValueError:
         body = None
     if status in (404, 410):
@@ -413,19 +395,7 @@ MEMO_MAX = 64
 
 
 def memoized(key, fn, ttl=MEMO_TTL):
-    now = time.monotonic()
-    with _memo_lock:
-        hit = _memo.get(key)
-        if hit and now - hit[0] < ttl:
-            _memo.move_to_end(key)
-            return hit[1]
-    value = fn()
-    with _memo_lock:
-        _memo[key] = (now, value)
-        _memo.move_to_end(key)
-        while len(_memo) > MEMO_MAX:
-            _memo.popitem(last=False)
-    return value
+    return memo.memoized(_memo, _memo_lock, MEMO_MAX, key, fn, ttl)
 
 
 def shared_raw(name, params, build, ttl):
@@ -433,30 +403,13 @@ def shared_raw(name, params, build, ttl):
     the service's response cache (pods share it) when one is installed,
     then build(). Without a `cache` module (the standalone package) it is
     the in-process memo alone."""
-    try:
-        from cache import cached_call
-    except ImportError:
-        cached_call = None
-    seconds = ttl.total_seconds() if hasattr(ttl, "total_seconds") else ttl
-    key = (name, json.dumps(params, sort_keys=True))
-    if cached_call is None:
-        return memoized(key, build, ttl=min(seconds, MEMO_TTL))
-    return memoized(key, lambda: cached_call(f"hirist.raw.{name}", params, lambda **_: build(), ttl),
-                    ttl=min(seconds, MEMO_TTL))
+    return memo.shared_raw(memoized, "hirist.raw.", MEMO_TTL, name, params, build, ttl)
 
 
 def run_parallel(fns, workers):
     """Run zero-arg callables in parallel; results align with `fns`. Each
     result is ("ok", value) or ("error", exception)."""
-    def guard(fn):
-        try:
-            return ("ok", fn())
-        except Exception as e:
-            return ("error", e)
-    if not fns:
-        return []
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(fns)))) as ex:
-        return list(ex.map(guard, fns))
+    return fanout.guarded_per_call(fns, workers)
 
 
 if __name__ == "__main__":

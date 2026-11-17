@@ -404,3 +404,65 @@ def test_company_profile_copies_are_trimmed(offline):
     assert out["ambitionbox"] and all(j["company"]["ambitionbox"] is None for j in out["jobs"])
     out = companies.open_jobs({"slug": "nagarro-software", "name": None})
     assert out["company"]["ambitionbox"]["name"] == "Nagarro" and all(j["company"]["ambitionbox"] is None for j in out["jobs"])
+
+
+# ---- egress: the gateway first, the residential exit on the last retry --------------------------------
+
+def test_last_retry_rides_the_fallback_exit(monkeypatch):
+    import config
+    asked, sessions = [], []
+
+    def proxy(fallback=False):
+        asked.append(fallback)
+        return "http://user:pass@resi:1" if fallback else "gateway:in"
+
+    class Sess:
+        def __init__(self, exit):
+            self.exit, self.headers = exit, {}
+
+        def close(self):
+            pass
+
+    def new_session(exit, impersonate=None):
+        sessions.append(exit)
+        return Sess(exit)
+
+    monkeypatch.setattr(config, "hirist_proxy", proxy)
+    monkeypatch.setattr(config, "HIRIST_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(fetch.egress, "new_session", new_session)
+    monkeypatch.setattr(fetch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fetch, "_local", fetch.threading.local())
+
+    # healthy: one gateway session serves call after call
+    assert [fetch._attempts("x", lambda s: s.exit) for _ in range(3)] == ["gateway:in"] * 3
+    assert sessions == ["gateway:in"] and asked == [False]
+
+    # the gateway refuses twice: the last retry rides the residential exit
+    seen = []
+
+    def send(sess):
+        seen.append(sess.exit)
+        if sess.exit == "gateway:in":
+            raise fetch.HiristBlocked("HTTP 403")
+        return "ok"
+
+    assert fetch._attempts("x", send) == "ok"
+    assert seen == ["gateway:in", "gateway:in", "http://user:pass@resi:1"] and asked[-3:] == [False, False, True]
+    # ...and the thread does not keep it: the next call starts on the gateway again
+    assert fetch._attempts("x", lambda s: s.exit) == "gateway:in"
+    # a NotFound is never retried
+    with pytest.raises(fetch.HiristNotFound):
+        fetch._attempts("x", lambda s: (_ for _ in ()).throw(fetch.HiristNotFound("gone")))
+    # every exit failing surfaces the last error
+    with pytest.raises(fetch.HiristUpstreamError):
+        fetch._attempts("x", lambda s: (_ for _ in ()).throw(fetch.HiristBlocked("HTTP 429")))
+    assert getattr(fetch._local, "exit", None) is None
+
+
+def test_service_exit_is_the_mumbai_gateway():
+    import config
+    if not hasattr(config, "HIRIST_FALLBACK_PROXY_COUNTRY"):
+        pytest.skip("open-source kit: its config has one HIRIST_PROXY")
+    assert config.hirist_proxy() == "gateway:in" and fetch.egress.gateway_country(config.hirist_proxy()) == "in"
+    assert fetch.egress.exit_country(config.hirist_proxy(fallback=True)) == "in"        # a proxy URL pinned to India
+    assert not config.gateway_exit(config.hirist_proxy(fallback=True))
